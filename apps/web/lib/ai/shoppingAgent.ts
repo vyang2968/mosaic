@@ -4,8 +4,6 @@ import { getVibeProfile } from '@/lib/server/vibe-profile'
 import { runAgentTurn, runAgentTurnStream } from './harness'
 import { resolveAgentModel, type AgentModelConfig } from './providers'
 import { createShoppingTools } from './tools/shoppingTools'
-import { performSearch } from '@/lib/server/searchOrchestrator'
-import { getSupabaseAdmin } from '@/lib/server/supabase'
 
 // The concrete shopping agent: harness.ts's generic loop + the shopping tool set + this system prompt.
 const SYSTEM_PROMPT = `You are Mosaic's shopping agent. You help the user build a cart of products that match their board's aesthetic (its "vibe profile") and their budget.
@@ -43,21 +41,24 @@ async function prepareShoppingTurn(input: ShoppingAgentTurnInput): Promise<{
   messages: ModelMessage[]
 }> {
   const { guestId, boardId, userMessage, conversationHistory = [], model } = input
-  const db = getSupabaseAdmin()
 
   const [vibeProfile, cart] = await Promise.all([
     getVibeProfile(guestId, boardId).catch(() => null),
     getCart(guestId, boardId),
   ])
 
-  // Proactively populate the internet-search cache before the agent tool loop begins.
-  if (vibeProfile) {
-    try {
-      await performSearch(vibeProfile, userMessage, guestId, db)
-    } catch (err) {
-      console.error('[shopping-agent] Internet search failed, continuing with cached/local results:', err)
-    }
-  }
+  // Internet search is NOT triggered proactively here — it used to run on
+  // every turn regardless of intent, which meant a pure cart-management
+  // turn (swap_item, replace_item, lock_item, set_budget — all local DB
+  // work via agent-alternates.ts, no network at all) paid the full
+  // internet-search cost anyway. That cost got much larger once
+  // internetSearch.ts started resolving each item's real URL and image at
+  // cache time (a Serper call + an og:image fetch per item), turning a
+  // cheap cache-warm into the dominant source of latency on every message,
+  // "replace this" included. search_products's own cache-miss handling
+  // (shoppingTools.ts) already triggers performSearch reactively when a
+  // turn actually needs fresh results — that's the only place this cost
+  // should be paid.
 
   const vibePhrase = (vibeProfile?.profile as { phrase?: unknown } | undefined)?.phrase ?? null
   console.log(
