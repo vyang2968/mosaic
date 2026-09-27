@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { useState } from "react";
 import { useParams } from "next/navigation";
 import { useBoards } from "@/lib/boards/useBoards";
@@ -31,9 +32,10 @@ export function BulletinBoard() {
     <div className="relative mx-auto max-w-7xl px-6 py-10 sm:px-10">
       <div className="mb-8 flex flex-wrap items-end justify-between gap-4">
         <div>
-          <p className="font-heading text-4xl text-stone-900 sm:text-5xl">
-            mosaic
-          </p>
+          <div className="flex items-center gap-2.5">
+            <Image src="/logo-mark.png" alt="" width={295} height={356} priority className="h-9 w-auto sm:h-11" />
+            <Image src="/logo-word.png" alt="mosaic" width={832} height={359} priority className="h-9 w-auto sm:h-11" />
+          </div>
           <p className="mt-1 text-sm text-stone-500">
             your worlds, all in one place
           </p>

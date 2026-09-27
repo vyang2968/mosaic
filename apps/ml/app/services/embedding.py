@@ -51,6 +51,7 @@ class EmbeddingService:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self._model = None
         self._processor = None
+        self._text_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor, dict[str, slice]]] = {}
 
     def _load(self) -> None:
         if self._model is not None:
@@ -65,19 +66,33 @@ class EmbeddingService:
 
     async def embed_image(self, image_bytes: bytes) -> list[float]:
         """Embed a single image into a feature vector."""
+        return (await self.embed_images([image_bytes]))[0]
+
+    async def embed_images(self, images: list[bytes], batch_size: int = 4) -> list[list[float]]:
+        """Embed image sets in small batches to avoid a model call per image."""
+        if not images:
+            return []
         self._load()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        inputs = self._processor(images=image, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            output = self._model.get_image_features(**inputs)
+        embeddings: list[list[float]] = []
+        for start in range(0, len(images), batch_size):
+            batch = []
+            for content in images[start : start + batch_size]:
+                with Image.open(io.BytesIO(content)) as image:
+                    batch.append(image.convert("RGB"))
+            inputs = self._processor(images=batch, return_tensors="pt").to(self.device)
+            with torch.inference_mode():
+                output = self._model.get_image_features(**inputs)
+                features = torch.nn.functional.normalize(self._features(output), dim=-1)
+            embeddings.extend(features.cpu().tolist())
+        return embeddings
+
+    @staticmethod
+    def _features(output: torch.Tensor) -> torch.Tensor:
         if hasattr(output, "pooler_output"):
-            features = output.pooler_output
-        elif hasattr(output, "last_hidden_state"):
-            features = output.last_hidden_state[:, 0, :]
-        else:
-            features = output
-        features = features / features.norm(dim=-1, keepdim=True)
-        return features.squeeze().cpu().tolist()
+            return output.pooler_output
+        if hasattr(output, "last_hidden_state"):
+            return output.last_hidden_state[:, 0, :]
+        return output
 
     async def classify_facets(
         self,
@@ -87,9 +102,9 @@ class EmbeddingService:
     ) -> FacetProfile:
         """Zero-shot classify using sigmoid scoring (not softmax).
 
-        Uses the model's learned logit_scale and logit_bias, then sigmoid
-        for independent per-label probabilities. This matches SigLIP2's
-        training objective (independent sigmoid loss).
+        Uses the model's learned logit_scale and logit_bias. Ranking and
+        null-anchor comparisons use logits directly because sigmoid is
+        monotonic, preserving the original independent-label decisions.
 
         Returns the top-k tags per facet (ranked by probability) instead of
         forcing a single winner, since a forced top-1 pick is noisy on any
@@ -104,59 +119,65 @@ class EmbeddingService:
         single shared anchor either over- or under-rejects depending on how
         readily each facet applies to non-object imagery.
         """
+        return (await self.classify_facets_batch([image_embedding], vocabularies, top_k))[0]
+
+    async def classify_facets_batch(
+        self,
+        image_embeddings: list[list[float]],
+        vocabularies: dict[str, list[str]] | None = None,
+        top_k: int = 3,
+    ) -> list[FacetProfile]:
+        """Score all images against cached text features in one matrix multiply."""
+        if not image_embeddings:
+            return []
         self._load()
         vocabularies = vocabularies or FACET_VOCABULARIES
+        text_mat, null_mat, facet_slices = self._get_text_features(vocabularies)
+        image_mat = torch.as_tensor(image_embeddings, dtype=text_mat.dtype, device=self.device)
+        image_mat = torch.nn.functional.normalize(image_mat, dim=-1)
 
-        all_prompts: list[str] = []
-        prompt_to_facet: list[str] = []
-        for facet, tags in vocabularies.items():
-            for tag in tags:
-                all_prompts.append(PROMPT_TEMPLATE.format(tag=tag))
-                prompt_to_facet.append(facet)
+        with torch.inference_mode():
+            logits = (image_mat @ text_mat.T * self._logit_scale + self._logit_bias).cpu()
+            null_logits = (image_mat @ null_mat.T * self._logit_scale + self._logit_bias).cpu()
 
-        null_prompts = [
-            PROMPT_TEMPLATE.format(tag=FACET_NULL_HINTS.get(facet, DEFAULT_NULL_HINT))
-            for facet in vocabularies
-        ]
-        null_embs = torch.tensor(self._embed_texts(null_prompts), dtype=torch.float32)
-        null_embs = null_embs / null_embs.norm(dim=-1, keepdim=True)
+        profiles = []
+        for image_idx in range(len(image_embeddings)):
+            profile = FacetProfile()
+            for facet_idx, (facet, tags) in enumerate(vocabularies.items()):
+                if not tags:
+                    continue
+                scores = logits[image_idx, facet_slices[facet]]
+                indices = torch.argsort(scores, descending=True)[:min(top_k, len(tags))]
+                anchor = null_logits[image_idx, facet_idx]
+                ranked = [tags[int(index)] for index in indices if scores[index] > anchor]
+                if ranked:
+                    setattr(profile, facet, ranked)
+            profiles.append(profile)
+        return profiles
 
-        profile = FacetProfile()
-        img_vec = torch.tensor(image_embedding, dtype=torch.float32)
-        img_norm = img_vec / img_vec.norm()
+    def _get_text_features(
+        self, vocabularies: dict[str, list[str]]
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, slice]]:
+        key = tuple((facet, tuple(tags)) for facet, tags in vocabularies.items())
+        if key not in self._text_cache:
+            prompts = []
+            facet_slices = {}
+            for facet, tags in vocabularies.items():
+                start = len(prompts)
+                prompts.extend(PROMPT_TEMPLATE.format(tag=tag) for tag in tags)
+                facet_slices[facet] = slice(start, len(prompts))
+            null_prompts = [
+                PROMPT_TEMPLATE.format(tag=FACET_NULL_HINTS.get(facet, DEFAULT_NULL_HINT))
+                for facet in vocabularies
+            ]
+            features = self._embed_texts(prompts + null_prompts)
+            self._text_cache[key] = (features[:len(prompts)], features[len(prompts):], facet_slices)
+            logger.info("Cached %d facet text features and %d null anchors", len(prompts), len(null_prompts))
+        return self._text_cache[key]
 
-        null_logits = (null_embs * img_norm).sum(dim=-1) * self._logit_scale + self._logit_bias
-        null_probs = torch.sigmoid(null_logits)
-
-        for facet_idx, facet in enumerate(vocabularies):
-            indices = [i for i, f in enumerate(prompt_to_facet) if f == facet]
-            facet_prompts = [all_prompts[i] for i in indices]
-
-            text_emb = self._embed_texts(facet_prompts)
-            text_mat = torch.tensor(text_emb, dtype=torch.float32)
-            text_mat = text_mat / text_mat.norm(dim=-1, keepdim=True)
-
-            cos_sim = (text_mat * img_norm).sum(dim=-1)
-            logits = cos_sim * self._logit_scale + self._logit_bias
-            probs = torch.sigmoid(logits)
-
-            null_prob = float(null_probs[facet_idx].detach())
-            k = min(top_k, len(vocabularies[facet]))
-            ranked_idx = torch.argsort(probs, descending=True)[:k].tolist()
-            ranked_idx = [i for i in ranked_idx if float(probs[i].detach()) > null_prob]
-
-            if not ranked_idx:
-                logger.debug("Facet %s: no candidate beat its null anchor (%.6f)", facet, null_prob)
-                continue
-
-            top_tags = [vocabularies[facet][i] for i in ranked_idx]
-            setattr(profile, facet, top_tags)
-
-        return profile
-
-    def _embed_texts(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
-        """Embed a list of text prompts into feature vectors."""
-        all_embeddings: list[list[float]] = []
+    def _embed_texts(self, texts: list[str], batch_size: int = 64) -> torch.Tensor:
+        """Embed text prompts once and retain normalized features on the model device."""
+        batches = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             inputs = self._processor(
@@ -166,14 +187,8 @@ class EmbeddingService:
                 max_length=64,
                 truncation=True,
             ).to(self.device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 output = self._model.get_text_features(**inputs)
-            if hasattr(output, "pooler_output"):
-                features = output.pooler_output
-            elif hasattr(output, "last_hidden_state"):
-                features = output.last_hidden_state[:, 0, :]
-            else:
-                features = output
-            features = features / features.norm(dim=-1, keepdim=True)
-            all_embeddings.extend(features.cpu().tolist())
-        return all_embeddings
+                features = torch.nn.functional.normalize(self._features(output), dim=-1)
+            batches.append(features)
+        return torch.cat(batches)

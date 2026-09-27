@@ -5,12 +5,13 @@
  */
 import { generateText } from 'ai'
 import { resolveAgentModel } from '@/lib/ai/providers'
+import { productFamilyFor, vibeTermsFromProfile } from './productType'
 
 // Max search queries generated per shopping-agent turn. More queries means
 // broader catalog coverage but more Serper calls (and more categorizer/
 // resolveDirectProductUrl calls downstream) per turn — tune via env instead
 // of a code change.
-const MAX_QUERIES = Number(process.env.SEARCH_QUERY_COUNT ?? 5)
+const MAX_QUERIES = Number(process.env.SEARCH_QUERY_COUNT ?? 3)
 
 export async function generateSearchQueries(
   vibeProfile: Record<string, unknown>,
@@ -23,6 +24,7 @@ export async function generateSearchQueries(
 
     const result = await generateText({
       model,
+      maxOutputTokens: 256,
       system: `You are a product search query generator for a shopping AI.
 
 Given a vibe profile and a user request, generate up to ${MAX_QUERIES} concise, specific search queries
@@ -44,7 +46,15 @@ User request: ${userRequest}`,
     const text = result.text.trim()
     const jsonMatch = text.match(/\[[\s\S]*\]/)
     if (jsonMatch) {
-      const queries = (JSON.parse(jsonMatch[0]) as string[]).slice(0, MAX_QUERIES)
+      const parsed = JSON.parse(jsonMatch[0]) as unknown
+      if (!Array.isArray(parsed)) return fallbackQueries(vibeProfile, userRequest)
+      const family = productFamilyFor(userRequest)
+      const queries = [...new Set(parsed.filter((value): value is string => typeof value === 'string')
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .filter((value) => !family || !productFamilyFor(value) || productFamilyFor(value) === family)
+        .map((value) => family && !productFamilyFor(value) ? `${value} ${family}` : value))].slice(0, MAX_QUERIES)
+      if (queries.length === 0) return fallbackQueries(vibeProfile, userRequest)
       console.log(`[searchQueryGenerator] Generated ${queries.length} queries`)
       return queries
     }
@@ -58,33 +68,27 @@ User request: ${userRequest}`,
   }
 }
 
-function fallbackQueries(
+export function fallbackQueries(
   vibeProfile: Record<string, unknown>,
   userRequest: string,
 ): string[] {
-  const terms = new Set<string>()
-
-  // Extract vibe terms
-  const colors = (vibeProfile.colors as string[]) ?? []
-  const materials = (vibeProfile.materials as string[]) ?? []
-  const styles = (vibeProfile.styles as string[]) ?? []
-  const qualities = (vibeProfile.qualities as string[]) ?? []
-
-  for (const t of [...colors, ...materials, ...styles, ...qualities]) {
-    terms.add(t.toLowerCase())
+  const facets = vibeProfile.facets as Record<string, unknown> | undefined
+  const first = (key: string): string | null => {
+    const values = facets?.[key]
+    return Array.isArray(values) && typeof values[0] === 'string' ? values[0].replaceAll('_', ' ') : null
   }
-
-  // Combine vibe terms with user request keywords
-  const userWords = userRequest.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []
-  const vibeTermArray = Array.from(terms)
-
-  const queries: string[] = []
-  for (let i = 0; i < Math.min(MAX_QUERIES, vibeTermArray.length); i++) {
-    queries.push(`${vibeTermArray[i]} ${userWords[0] ?? ''}`.trim())
-  }
-  if (queries.length === 0) {
-    queries.push(userRequest)
-  }
-
-  return queries.slice(0, MAX_QUERIES)
+  const request = userRequest.trim()
+  const explicitColor = /\b(?:red|blue|green|yellow|orange|purple|pink|black|white|gr[ae]y|brown|beige|cream|navy|olive|tan|gold|silver)\b/i.test(request)
+  const colors = Array.isArray(facets?.color) ? (facets.color as unknown[])
+    .filter((value): value is string => typeof value === 'string').map((value) => value.replaceAll('_', ' ')) : []
+  const terms = [...new Set([
+    explicitColor ? null : first('color'), first('style'),
+    ...vibeTermsFromProfile(vibeProfile).filter((value) => !explicitColor || !colors.includes(value)),
+  ].filter((value): value is string => Boolean(value)))]
+  const family = productFamilyFor(request)
+  const base = request.replace(/^(?:please\s+)?(?:find(?: me)?|shop for|show me|look for|get me|add)\s+/i, '').trim() || family || request
+  const queries = terms.map((term) => `${term} ${base}`.trim())
+  if (request && !family) queries.unshift(request)
+  if (queries.length === 0) queries.push(request)
+  return [...new Set(queries)].slice(0, MAX_QUERIES)
 }

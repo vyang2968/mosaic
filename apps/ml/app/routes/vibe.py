@@ -6,7 +6,7 @@ import httpx
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from app.models.facets import FACET_VOCABULARIES, FacetProfile
+from app.models.facets import FACET_VOCABULARIES
 from app.models.vibe import VibeResult
 from app.services.aggregation import AggregationService
 from app.services.color import get_color_names
@@ -58,25 +58,19 @@ class FacetVocabulariesResponse(BaseModel):
 async def _run_pipeline(images: list[bytes]) -> VibeResult:
     """Shared analysis pipeline: embed → heterogeneity → classify → aggregate → compose."""
     embedder = get_embedding_service()
-    embeddings: list[list[float]] = []
-    for content in images:
-        embedding = await embedder.embed_image(content)
-        embeddings.append(embedding)
+    embeddings = await embedder.embed_images(images)
     logger.info("Generated %d embeddings (dim=%d)", len(embeddings), len(embeddings[0]) if embeddings else 0)
 
     aggregator = get_aggregation_service()
     is_mixed = await aggregator.detect_heterogeneity(embeddings)
     logger.info("Heterogeneity detection: mixed=%s", is_mixed)
 
-    per_image_facets: list[FacetProfile] = []
+    non_color_facets = {k: v for k, v in FACET_VOCABULARIES.items() if k != "color"}
+    per_image_facets = await embedder.classify_facets_batch(embeddings, non_color_facets)
     for i, content in enumerate(images):
         color_names = get_color_names(content)
         logger.info("Image %d color: %s", i, color_names)
-
-        non_color_facets = {k: v for k, v in FACET_VOCABULARIES.items() if k != "color"}
-        profile = await embedder.classify_facets(embeddings[i], non_color_facets)
-        profile.color = color_names
-        per_image_facets.append(profile)
+        per_image_facets[i].color = color_names
 
     aggregated = await aggregator.aggregate(per_image_facets)
     logger.info("Aggregated facets: %s", aggregated.surviving_facets())

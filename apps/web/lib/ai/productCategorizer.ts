@@ -23,6 +23,7 @@ export async function categorizeProducts(titles: string[]): Promise<string[]> {
     const model = resolveAgentModel()
     const { object } = await generateObject({
       model,
+      maxOutputTokens: 256,
       // Not an exact-length array: the model occasionally drops or adds an
       // item on a 40-title batch, and an exact `.length()` constraint used
       // to reject the *entire* response over one miscount — turning 38

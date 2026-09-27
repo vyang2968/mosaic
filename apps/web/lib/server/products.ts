@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { isGoogleInterstitialUrl, resolveDirectProductUrl } from './internetSearch'
 import { getSupabaseAdmin } from './supabase'
+import { matchesProductFamily, productFamilyFor } from '@/lib/ai/productType'
 
 // This is the `searchProducts(query, category, maxPrice)` interface described
 // in the root README's "Product discovery" section. Today it queries the
@@ -26,6 +27,7 @@ export type ProductSearchFilters = {
   query?: string
   category?: string
   maxPriceCents?: number
+  vibeTerms?: string[]
 }
 
 type ProductRow = {
@@ -39,9 +41,11 @@ type ProductRow = {
   image_url: string | null
   product_url: string | null
   available: boolean
+  updated_at?: string
+  metadata?: { query?: string }
 }
 
-const PRODUCT_COLUMNS = 'id, merchant_id, name, description, category, price_cents, currency, image_url, product_url, available'
+const PRODUCT_COLUMNS = 'id, merchant_id, name, description, category, price_cents, currency, image_url, product_url, available, updated_at, metadata'
 
 function mapProductRow(row: ProductRow, merchantName: string, checkoutMethod: string): Product {
   return {
@@ -78,36 +82,60 @@ export async function searchProducts(
   filters: ProductSearchFilters,
   db: SupabaseClient = getSupabaseAdmin(),
 ): Promise<Product[]> {
-  let request = db.from('products').select(PRODUCT_COLUMNS).eq('available', true).order('name', { ascending: true })
+  const family = productFamilyFor(filters.query ?? '') ?? productFamilyFor(filters.category ?? '')
+  const tokens = [...new Set(`${filters.query ?? ''} ${filters.category ?? ''}`.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])]
+  const vibeTokens = [...new Set((filters.vibeTerms ?? []).flatMap((term) => term.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []))]
+  // PostgREST caps a response at 1,000 rows by default. Page through the
+  // catalog so new web results cannot disappear behind older alphabetic rows.
+  const rows: ProductRow[] = []
+  const pageSize = 1000
+  for (let offset = 0; ; offset += pageSize) {
+    let request = db.from('products').select(PRODUCT_COLUMNS).eq('available', true)
+      .order('id', { ascending: true }).range(offset, offset + pageSize - 1)
+    if (typeof filters.maxPriceCents === 'number') request = request.lte('price_cents', filters.maxPriceCents)
+    // Preserve the indexed SQL prefilter for free-text searches. Product
+    // families use local synonym matching ("shoes" can mean "boots"), so
+    // their candidates need the complete available catalog.
+    if (!family && tokens.length) {
+      request = request.or(tokens.flatMap((token) => ['name', 'description', 'category']
+        .map((column) => `${column}.ilike.%${token}%`)).join(','))
+    }
+    const { data, error } = await request
+    if (error) throw new Error('Could not search products')
+    const page = (data ?? []) as ProductRow[]
+    rows.push(...page)
+    if (page.length < pageSize) break
+  }
 
-  if (typeof filters.maxPriceCents === 'number') request = request.lte('price_cents', filters.maxPriceCents)
-  const { data, error } = await request
-  if (error) throw new Error('Could not search products')
-  // The seeded catalog is small. Match generated multi-word searches against
-  // names, descriptions, and categories so a phrase such as "warm ceramic
-  // lamp" can retrieve candidates for AI ranking. A larger provider should
-  // replace this with indexed search while preserving the response contract.
-  //
-  // `category` is folded into the token match instead of an exact `WHERE`
-  // filter: it's an inferred guess on both sides (the agent's freeform
-  // guess, and internetSearch.ts's keyword-based inference for cached
-  // internet products) — an exact match between two guessers is fragile by
-  // construction (e.g. agent says "clothing", cache inferred "general" for a
-  // jacket neither's keyword list covered), and a hard filter turns any such
-  // mismatch into a silent, permanent zero-result search.
-  const tokens = [
-    ...new Set(
-      `${filters.query ?? ''} ${filters.category ?? ''}`.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [],
-    ),
-  ]
-  const candidates = ((data ?? []) as ProductRow[]).map((row) => {
-    const searchable = `${row.name} ${row.description ?? ''} ${row.category ?? ''}`.toLowerCase()
-    return { row, score: tokens.filter((token) => searchable.includes(token)).length }
+  const hasWord = (text: string, word: string) => new RegExp(`(^|[^\\p{L}\\p{N}])${word}($|[^\\p{L}\\p{N}])`, 'u').test(text)
+  const candidates = rows.flatMap((row) => {
+    if (family && !matchesProductFamily(`${row.name} ${row.category ?? ''}`, family)) return []
+    const name = row.name.toLowerCase()
+    const category = (row.category ?? '').toLowerCase()
+    const description = (row.description ?? '').toLowerCase()
+    const sourceQuery = (row.metadata?.query ?? '').toLowerCase()
+    const queryScore = (family ? 2 : 0) + tokens.reduce((score, token) => score +
+      (hasWord(name, token) ? 4 : 0) + (hasWord(category, token) ? 2 : 0) + (hasWord(description, token) ? 1 : 0), 0)
+    if (tokens.length && queryScore === 0) return []
+    const vibeScore = vibeTokens.reduce((score, token) => score +
+      (hasWord(name, token) ? 3 : 0) + (hasWord(description, token) ? 1 : 0)
+      + (hasWord(sourceQuery, token) ? 2 : 0), 0)
+    return [{ row, score: queryScore + vibeScore }]
   })
-  const bestScore = Math.max(0, ...candidates.map((candidate) => candidate.score))
-  const rows = candidates.filter((candidate) => tokens.length === 0 || (candidate.score > 0 && candidate.score === bestScore))
-    .map((candidate) => candidate.row)
-  return attachMerchantNames(rows, db)
+  candidates.sort((a, b) => b.score - a.score
+    || (b.row.updated_at ?? '').localeCompare(a.row.updated_at ?? '')
+    || a.row.name.localeCompare(b.row.name))
+  const seenUrls = new Set<string>()
+  const seenNames = new Set<string>()
+  const unique = candidates.filter(({ row }) => {
+    const name = row.name.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
+    const url = row.product_url?.toLowerCase() ?? ''
+    if (seenNames.has(name) || (url && seenUrls.has(url))) return false
+    seenNames.add(name)
+    if (url) seenUrls.add(url)
+    return true
+  })
+  return attachMerchantNames(unique.map(({ row }) => row), db)
 }
 
 // Used by the cart service to resolve current catalog prices/details for

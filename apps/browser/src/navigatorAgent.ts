@@ -37,14 +37,26 @@ You will never see or act on a real payment step — a separate hard-coded check
 If a guest-checkout or shipping form appears, you may fill it using this fixed placeholder identity — never invent real user data, and never fill a card/payment field under any circumstance:
 ${JSON.stringify(PLACEHOLDER_IDENTITY)}
 
-You are given a Playwright ARIA accessibility snapshot (YAML-like text) of the current page. Each interactive element is tagged with a [ref=eN] you must reference exactly. Decide ONE single next action that makes the most progress by calling the decide_next_action tool. If the page offers nothing useful (e.g. you are blocked, logged out, or the tree has no relevant controls), respond "stuck".`
+You are given a Playwright ARIA accessibility snapshot (YAML-like text) of the current page. Each interactive element is tagged with a [ref=eN] you must reference exactly. Decide ONE single next action that makes the most progress by calling the decide_next_action tool. If the page offers nothing useful (e.g. you are blocked, logged out, or the tree has no relevant controls), respond "stuck".
 
-export async function decideNextAction(snapshot: string, currentUrl: string): Promise<NavigatorDecision> {
+Common obstacles and how to handle them:
+- Cookie-consent, newsletter, or promo overlays are usually dismissed automatically before you see this snapshot. If one is still visible anyway, closing/accepting it is always the right next action — it blocks clicks on everything underneath.
+- If the previous action is reported as failed below, do not repeat the exact same action — the ref may be stale (elements re-ref after the page changes) or the wrong element entirely. Re-read the current snapshot and pick a different ref or approach.
+- Sites vary in wording ("Add to Bag", "Add to Cart", "Add to Basket") and flow (a mini-cart drawer vs. a full cart page vs. an inline quantity stepper) — use the snapshot's actual labels, not a fixed pattern.`
+
+export async function decideNextAction(
+  snapshot: string,
+  currentUrl: string,
+  lastActionResult?: { action: string; ref?: string; success: boolean; detail: string | null },
+): Promise<NavigatorDecision> {
   const model = resolveNavigatorModel()
+  const lastActionLine = lastActionResult
+    ? `Previous action: ${lastActionResult.action}${lastActionResult.ref ? ` on ${lastActionResult.ref}` : ''} — ${lastActionResult.success ? 'succeeded' : `FAILED (${lastActionResult.detail ?? 'no detail'})`}\n\n`
+    : ''
   const result = await generateText({
     model,
     system: SYSTEM_PROMPT,
-    prompt: `Current URL: ${currentUrl}\n\nAccessibility snapshot:\n${snapshot}`,
+    prompt: `${lastActionLine}Current URL: ${currentUrl}\n\nAccessibility snapshot:\n${snapshot}`,
     tools: { decide_next_action: tool({ description: 'Report the single next browser action to take.', inputSchema: DecisionSchema }) },
     toolChoice: { type: 'tool', toolName: 'decide_next_action' },
   })

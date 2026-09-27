@@ -18,6 +18,8 @@ class FakeQueryBuilder implements PromiseLike<QueryResult> {
   private payload: FakeRow | FakeRow[] | undefined
   private countOnly = false
   private upsertConflictColumn: string | undefined
+  private rowRange: { from: number; to: number } | undefined
+  private rowLimit: number | undefined
 
   constructor(private table: FakeRow[]) {}
 
@@ -37,13 +39,44 @@ class FakeQueryBuilder implements PromiseLike<QueryResult> {
     return this
   }
 
+  or(expression: string): this {
+    const clauses = expression.split(',').map((part) => {
+      const match = part.match(/^([a-z_]+)\.ilike\.(.+)$/i)
+      if (!match) throw new Error(`Unsupported fake Supabase OR clause: ${part}`)
+      return { column: match[1], pattern: ilikeToRegExp(match[2]) }
+    })
+    this.predicates.push((row) => clauses.some(({ column, pattern }) => pattern.test(String(row[column] ?? ''))))
+    return this
+  }
+
   lte(column: string, value: number): this {
     this.predicates.push((row) => (row[column] as number) <= value)
     return this
   }
 
-  gte(column: string, value: number): this {
-    this.predicates.push((row) => (row[column] as number) >= value)
+  gte(column: string, value: number | string): this {
+    this.predicates.push((row) => typeof value === 'number'
+      ? Number(row[column]) >= value
+      : String(row[column] ?? '') >= value)
+    return this
+  }
+
+  contains(column: string, value: Record<string, unknown>): this {
+    this.predicates.push((row) => {
+      const current = row[column]
+      return typeof current === 'object' && current !== null
+        && Object.entries(value).every(([key, expected]) => (current as FakeRow)[key] === expected)
+    })
+    return this
+  }
+
+  range(from: number, to: number): this {
+    this.rowRange = { from, to }
+    return this
+  }
+
+  limit(count: number): this {
+    this.rowLimit = count
     return this
   }
 
@@ -132,6 +165,8 @@ class FakeQueryBuilder implements PromiseLike<QueryResult> {
       })
     }
     if (this.countOnly) return { data: null, error: null, count: rows.length }
+    if (this.rowRange) rows = rows.slice(this.rowRange.from, this.rowRange.to + 1)
+    if (this.rowLimit !== undefined) rows = rows.slice(0, this.rowLimit)
     return { data: rows, error: null }
   }
 

@@ -35,7 +35,7 @@ const LOADING_WORDS = [
   "Hot on the trail", "Chasing the drip", "Securing the bag", "Bet, searching",
 ];
 const TOOL_LABELS: Record<string, string> = {
-  search_products: "Searching the catalog",
+  search_products: "Searching shopping sites",
   browse_webpage: "Reading a product page",
   browse_summary: "Skimming a product page",
   run_merchant_checkout: "Walking through checkout",
@@ -384,7 +384,7 @@ export function BoardCommerce({ boardId, vibeName }: { boardId: string; vibeName
           <input id="shopping-message" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="What would you like to find?" className="min-w-0 flex-1 rounded-xl border border-stone-300 bg-white px-4 py-3 text-sm outline-none focus:border-stone-500" />
           <button type="submit" disabled={loading || Boolean(busy) || !query.trim() || cart?.status !== "open"} className="rounded-xl bg-stone-900 px-5 py-3 text-sm font-medium text-white disabled:opacity-40">{busy === "shop" ? "Shopping…" : "Send"}</button>
         </form>
-        <p className="mt-2 text-xs text-stone-500">Mosaic chooses from the demo catalog. You can still adjust or remove items in your cart.</p>
+        <p className="mt-2 text-xs text-stone-500">Mosaic searches shopping sites for products that fit this board. You can adjust or remove items in your cart.</p>
       </section>
 
       <aside aria-label="Cart and checkout" className="min-w-0 rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
@@ -438,7 +438,10 @@ export function BoardCommerce({ boardId, vibeName }: { boardId: string; vibeName
         {cart && cart.status === "open" && cart.items.length > 0 && <div className="mt-6 rounded-xl bg-[#f8f1e7] p-4">
           <h3 className="font-medium text-stone-900">Review checkout</h3>
           <p className="mt-1 text-xs text-stone-600">Demo-catalog items use Stripe test mode — you approve a separate hosted payment per merchant. Internet-sourced items instead get walked to their real checkout page and stopped right before payment, with a screenshot as proof. No real money moves either way.</p>
-          <button type="button" disabled={Boolean(busy)} onClick={() => void beginCheckout()} className="mt-3 w-full rounded-xl bg-stone-900 px-4 py-3 text-sm font-semibold text-white disabled:opacity-40">{busy === "checkout" ? "Starting…" : "Start checkout"}</button>
+          <button type="button" disabled={Boolean(busy)} onClick={() => void beginCheckout()} className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-stone-900 px-4 py-3 text-sm font-semibold text-white disabled:opacity-40">
+            {busy === "checkout" && <Spinner className="text-white" />}
+            {busy === "checkout" ? "Starting…" : "Start checkout"}
+          </button>
         </div>}
 
         {activeCheckout && checkout && <div className="mt-6 border-t border-stone-200 pt-5">
@@ -462,5 +465,14 @@ export function BoardCommerce({ boardId, vibeName }: { boardId: string; vibeName
       </aside>
       <ImageLightbox image={lightboxImage} onClose={() => setLightboxImage(null)} />
     </div>
+  );
+}
+
+function Spinner({ className = "" }: { className?: string }) {
+  return (
+    <svg className={`h-4 w-4 animate-spin ${className}`} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
   );
 }

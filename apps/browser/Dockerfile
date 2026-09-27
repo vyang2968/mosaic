@@ -12,7 +12,9 @@ RUN bun install --frozen-lockfile --ignore-scripts
 COPY src/ ./src/
 COPY tsconfig.json ./
 RUN bun test
-RUN chown -R pwuser:pwuser /app
+# Dependencies and source only need to be readable by pwuser. Avoid recursively
+# changing ownership of node_modules and Playwright files on every code edit.
+RUN chown pwuser:pwuser /app
 
 USER pwuser
 EXPOSE 8100

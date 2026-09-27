@@ -48,9 +48,8 @@ export async function searchInternet(
       hl: 'en',
     }
     if (maxPriceCents) {
-      const min = Math.floor(maxPriceCents / 100)
       const max = Math.ceil(maxPriceCents / 100)
-      body.price = `${min}-${max}`
+      body.price = `0-${max}`
     }
 
     const response = await fetch('https://google.serper.dev/shopping', {
@@ -78,29 +77,27 @@ export async function searchInternet(
     // Serper's num param is a hint, not a hard cap (observed returning up to
     // 40 results even when set to 10) — slice explicitly so the env var
     // actually controls the count regardless of what Serper decides to send.
-    const validResults = shoppingResults.filter((item) => item.title && item.link).slice(0, ITEMS_PER_QUERY)
+    const validResults = shoppingResults.filter((item) => item.title && item.link
+      && parsePrice(item.price ?? '') > 0
+      && (!maxPriceCents || parsePrice(item.price ?? '') <= maxPriceCents))
+      .slice(0, ITEMS_PER_QUERY)
 
     // One batched classification call per query's result set, not per product.
     const categories = category
       ? validResults.map(() => category)
       : await categorizeProducts(validResults.map((item) => item.title))
 
-    // Serper's /shopping link and imageUrl are both Google-hosted proxies —
-    // a google.com/search?ibp=oshop interstitial and an
-    // encrypted-tbnN.gstatic.com thumbnail, never the merchant's own page or
-    // image. Resolved here, at cache time, not lazily on click: what's
-    // stored/shown anywhere downstream (search results, cart, "view
-    // product") must never be a Google link, so it can't be deferred to
-    // whichever caller happens to touch it first. Per-item failures are
-    // dropped rather than cached with a bad link — better to have fewer
-    // correct products than a full set with broken ones.
+    // Serper's /shopping link is a Google-hosted interstitial, resolved to
+    // the real merchant URL here at cache time. imageUrl falls back to
+    // Serper's gstatic thumbnail — always a real image — when scraping the
+    // merchant page's og:image fails or returns an HTML preview page.
     const resolved = await Promise.all(
       validResults.map(async (item, i) => {
         try {
           const merchantName = item.source || extractMerchant(item.link)
           const directUrl = await resolveDirectProductUrl(`${item.title} ${merchantName}`)
           if (!directUrl) return null
-          const imageUrl = await fetchOgImage(directUrl)
+          const imageUrl = (await fetchOgImage(directUrl)) ?? item.imageUrl ?? null
           return {
             title: item.title,
             priceCents: parsePrice(item.price ?? ''),
@@ -128,9 +125,9 @@ export async function searchInternet(
 
 function parsePrice(price: string): number {
   // Shopping results give a single price per listing, e.g. "$24.99".
-  const match = price.match(/(\d+(?:\.\d+)?)/)
+  const match = price.match(/(\d[\d,]*(?:\.\d+)?)/)
   if (match) {
-    const dollars = parseFloat(match[1])
+    const dollars = parseFloat(match[1].replaceAll(',', ''))
     if (!isNaN(dollars)) return Math.round(dollars * 100)
   }
   return 0

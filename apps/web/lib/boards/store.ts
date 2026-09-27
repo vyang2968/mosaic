@@ -1,3 +1,4 @@
+import type { ModelMessage } from "ai";
 import type { Board, BoardImage, CreateBoardInput, VibeProfile } from "@/types/board";
 
 type ApiBoard = { id: string; name: string; createdAt: string };
@@ -191,8 +192,14 @@ export async function searchProducts(query: string, maxPriceCents?: number): Pro
 export type ShoppingStreamEvent =
   | { type: "text-delta"; text: string }
   | { type: "tool-call"; toolName: string }
-  | { type: "done"; assistantMessage: string; cart: Cart; steps: number }
+  | { type: "done"; assistantMessage: string; cart: Cart; steps: number; conversationHistory: ModelMessage[] }
   | { type: "error"; message: string };
+
+// Per-board turn history (assistant text + tool calls/results), kept in
+// memory only — sent back to the chat route on every turn so the model can
+// resolve references like "add 1" or "yes" to what it said/did earlier.
+// Without this, each turn looked like the start of a brand new conversation.
+const conversationHistories = new Map<string, ModelMessage[]>();
 
 // The chat route streams newline-delimited JSON; onEvent drives live text and an activity indicator.
 export async function shopWithAgent(
@@ -200,10 +207,11 @@ export async function shopWithAgent(
   message: string,
   onEvent?: (event: ShoppingStreamEvent) => void,
 ): Promise<ShoppingReply> {
+  const conversationHistory = conversationHistories.get(boardId) ?? [];
   const response = await fetch(`/api/boards/${encodeURIComponent(boardId)}/chat`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, conversationHistory }),
     cache: "no-store",
   });
   if (!response.ok || !response.body) {
@@ -229,8 +237,10 @@ export async function shopWithAgent(
       if (!line) continue;
       const event = JSON.parse(line) as ShoppingStreamEvent;
       if (event.type === "error") throw new Error(event.message);
-      if (event.type === "done") result = { assistantMessage: event.assistantMessage, cart: event.cart, steps: event.steps };
-      else onEvent?.(event);
+      if (event.type === "done") {
+        conversationHistories.set(boardId, event.conversationHistory);
+        result = { assistantMessage: event.assistantMessage, cart: event.cart, steps: event.steps };
+      } else onEvent?.(event);
     }
   }
   if (!result) throw new Error("Agent stream ended without a result");

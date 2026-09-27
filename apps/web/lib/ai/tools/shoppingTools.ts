@@ -5,8 +5,9 @@ import { applyCartActions, type CartAction } from '@/lib/server/cart-actions'
 import { searchProducts } from '@/lib/server/products'
 import { dropAlternates, popNextAlternate, storeAlternates } from '@/lib/server/agent-alternates'
 import { getSupabaseAdmin } from '@/lib/server/supabase'
-import { performSearch } from '@/lib/server/searchOrchestrator'
-import type { VibeProfile } from '@/lib/server/vibe-profile'
+import { searchAndCacheQuery } from '@/lib/server/searchOrchestrator'
+import { vibeTermsFromProfile } from '@/lib/ai/productType'
+import { fallbackQueries } from '@/lib/ai/searchQueryGenerator'
 import { browseWebpage, getPageSummary } from '@/lib/server/browser'
 import { runMerchantCheckout } from '@/lib/server/browserCheckout'
 import { isGoogleInterstitialUrl, resolveDirectProductUrl } from '@/lib/server/internetSearch'
@@ -31,7 +32,10 @@ async function resolveBrowseTarget(url: string): Promise<string> {
 // Routing the model's own view through the same redirect fixes it
 // regardless of where the link ends up: a product card, or pasted into text.
 function displayUrlFor(productId: string): string | null {
-  const baseUrl = process.env.APP_BASE_URL
+  let baseUrl = process.env.APP_BASE_URL
+  if (process.env.VERCEL_URL && (!baseUrl || /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(baseUrl))) {
+    baseUrl = `https://${process.env.VERCEL_URL}`
+  }
   if (!baseUrl) return null
   return new URL(`/api/products/${productId}/link`, baseUrl).toString()
 }
@@ -65,7 +69,7 @@ export function createShoppingTools(
 
   return {
     search_products: tool({
-      description: `Search the product catalog by query, category, and max price. Returns up to ${CANDIDATE_POOL_SIZE} close matches withwith product URLs you can visit. Use productUrl to click through to the retailer's website. Use this to find a productId before adding it to the cart.`,
+      description: `Search current web shopping results and the product catalog by query, category, and max price. Returns up to ${CANDIDATE_POOL_SIZE} close matches with product URLs you can visit. Include the requested item type and board vibe in the query. Use this to find a productId before adding it to the cart.`,
       inputSchema: z.object({
         query: z.string().optional().describe('Free-text search, e.g. "desk lamp"'),
         category: z.string().optional(),
@@ -89,25 +93,19 @@ export function createShoppingTools(
             }))
           }
 
-          const products = (await searchProducts({ query, category, maxPriceCents }, db)).slice(0, CANDIDATE_POOL_SIZE)
-
-          // Cache miss: trigger internet search, re-cache, then return results.
-          if (products.length === 0) {
-            console.log(`[shopping-tools] Cache miss for "${query}", triggering internet search...`)
-            try {
-              const vibeProfile = await db.from('vibe_profiles').select('profile_json').eq('board_id', boardId).maybeSingle()
-              if ((vibeProfile as { data: { profile_json: Record<string, unknown> } } | null)?.data) {
-                const vp = (vibeProfile as { data: { profile_json: Record<string, unknown> } }).data.profile_json
-                const fakeVibeProfile: VibeProfile = { profile: vp, name: '', description: null, updatedAt: '' }
-                await performSearch(fakeVibeProfile, query ?? '', guestId, db)
-              }
-            } catch (err) {
-              console.error('[shopping-tools] Internet search failed:', err)
-            }
-            return toResult((await searchProducts({ query, category, maxPriceCents }, db)).slice(0, CANDIDATE_POOL_SIZE))
+          const { data: vibeRow } = await db.from('vibe_profiles').select('profile_json').eq('board_id', boardId).maybeSingle()
+          const profile = (vibeRow as { profile_json?: Record<string, unknown> } | null)?.profile_json ?? null
+          const vibeTerms = vibeTermsFromProfile(profile)
+          const searchTerm = query?.trim() || category?.trim()
+          if (searchTerm) {
+            const queries = [searchTerm, ...fallbackQueries(profile ?? {}, searchTerm).filter((value) => value !== searchTerm).slice(0, 2)]
+            const searches = await Promise.allSettled(queries.map((value, index) =>
+              searchAndCacheQuery(value, db, index === 0 ? category : undefined, maxPriceCents)))
+            searches.forEach((outcome, index) => {
+              if (outcome.status === 'rejected') console.warn(`[shopping-tools] Live search failed for "${queries[index]}":`, outcome.reason)
+            })
           }
-
-          return toResult(products)
+          return toResult((await searchProducts({ query, category, maxPriceCents, vibeTerms }, db)).slice(0, CANDIDATE_POOL_SIZE))
         } catch (err) {
           console.error('[shopping-tools] search_products failed:', err)
           return []

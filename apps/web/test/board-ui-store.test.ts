@@ -134,14 +134,20 @@ test('shopping conversation sends one request and receives an updated cart', asy
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     expect(String(input)).toBe('/api/boards/board-1/chat')
     expect(init?.method).toBe('POST')
-    expect(JSON.parse(String(init?.body))).toEqual({ message: 'Find a warm lamp under $100' })
+    expect(JSON.parse(String(init?.body))).toEqual({ message: 'Find a warm lamp under $100', conversationHistory: [] })
     // The chat route streams newline-delimited JSON events, not one buffered
     // body — see shoppingAgent.ts's runShoppingAgentTurnStream.
     const events = [
       { type: 'tool-call', toolName: 'search_products' },
       { type: 'text-delta', text: 'Added a ' },
       { type: 'text-delta', text: 'lamp.' },
-      { type: 'done', assistantMessage: 'Added a lamp.', cart: { items: [{ productId: 'lamp' }], totalCents: 5500 }, steps: 3 },
+      {
+        type: 'done',
+        assistantMessage: 'Added a lamp.',
+        cart: { items: [{ productId: 'lamp' }], totalCents: 5500 },
+        steps: 3,
+        conversationHistory: [{ role: 'user', content: 'Find a warm lamp under $100' }],
+      },
     ]
     const body = events.map((event) => `${JSON.stringify(event)}\n`).join('')
     return new Response(body, { headers: { 'content-type': 'application/x-ndjson' } })

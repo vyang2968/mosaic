@@ -1,3 +1,4 @@
+import type { ModelMessage } from 'ai'
 import { getOrCreateGuest, guestCookie, type GuestSession } from '@/lib/server/guest-session'
 import { routeError } from '@/lib/server/http'
 import { validationError } from '@/lib/server/errors'
@@ -18,13 +19,16 @@ export async function POST(request: Request, { params }: Context) {
     if (typeof userMessage !== 'string' || !userMessage.trim()) {
       throw validationError('Request body must be { message: string }')
     }
+    const conversationHistory = Array.isArray((body as { conversationHistory?: unknown })?.conversationHistory)
+      ? ((body as { conversationHistory: unknown[] }).conversationHistory as ModelMessage[])
+      : []
 
     const guestId = guest.id
     const encoder = new TextEncoder()
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         try {
-          for await (const event of runShoppingAgentTurnStream({ guestId, boardId, userMessage })) {
+          for await (const event of runShoppingAgentTurnStream({ guestId, boardId, userMessage, conversationHistory })) {
             controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`))
           }
         } catch (err) {
